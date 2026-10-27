@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Unit tests for W-016 (#327): Closed-world A5 foreign-call capture-write check-site."""
 
+import sys
+from pathlib import Path
 import unittest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from tools import escape_sites
 
 EXAMPLE_06_HTTP_SERVER = """
