@@ -8,7 +8,7 @@ import re
 import time
 from typing import Dict, List, Optional, Tuple
 
-VALIDATOR_VERSION = "w013-tv-v1.0.0"
+VALIDATOR_VERSION = "w013-tv-v1.1.0"
 EMITTER_REFERENCE_LOC = 612
 
 
@@ -68,42 +68,91 @@ def build_certificate(ir: CheckedEffectIR, go_source: str, effect_summaries: Dic
     )
 
 
-def parse_lowered_go_cfg(go_source: str, effect_summaries: Dict[str, str]) -> Tuple[Optional[List[IREffectOp]], Optional[str]]:
-    ops: List[IREffectOp] = []
-    for raw_line in go_source.splitlines():
-        line = raw_line.strip()
-        if not line or line in ("{", "}") or line.startswith("func ") or line.startswith("package "):
+def _extract_target_body(go_source: str, target_fn: Optional[str]) -> Tuple[Optional[List[str]], Optional[str]]:
+    if not target_fn:
+        return [l.strip() for l in go_source.splitlines()], None
+    body, in_target, found, depth = [], False, False, 0
+    for raw in go_source.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("package ") or (depth == 0 and line.startswith("//")):
+            continue
+        if depth == 0:
+            m_fn = re.match(r"^func\s+([a-zA-Z_]\w*)\s*\([^{]*\{(.*)$", line)
+            if not m_fn:
+                return None, f"Unsupported top-level declaration: '{line}'"
+            fn_name, tail = m_fn.group(1), m_fn.group(2).strip()
+            if fn_name == target_fn and found:
+                return None, f"Duplicate target function '{target_fn}'"
+            in_target = fn_name == target_fn
+            found = found or in_target
+            depth = 1 + tail.count("{") - tail.count("}")
+            if in_target and depth > 0 and tail:
+                body.append(tail)
+            in_target = in_target and depth > 0
+            continue
+        opens, closes = line.count("{"), line.count("}")
+        if depth + opens - closes <= 0:
+            rem = line[:-1].strip() if line.endswith("}") else line
+            if in_target and rem:
+                body.append(rem)
+            depth, in_target = 0, False
+        else:
+            depth += opens - closes
+            if in_target:
+                body.append(line)
+    if not found or depth != 0:
+        return None, f"Target function '{target_fn}' not found in lowered Go source"
+    return body, None
+
+
+def parse_lowered_go_cfg(
+    go_source: str, effect_summaries: Dict[str, str], target_fn: Optional[str] = None
+) -> Tuple[Optional[List[IREffectOp]], Optional[str]]:
+    lines, err = _extract_target_body(go_source, target_fn)
+    if err is not None or lines is None:
+        return None, err
+    ops, terminated = [], False
+    for line in lines:
+        if not line or line in ("{", "}"):
             continue
         if re.match(r"^(panic|defer|recover|goto)\b", line):
             return None, f"Unmodeled Go construct in lowered output: '{line}'"
         if line.startswith("// hy:managed") or line.startswith("/* hy:managed"):
-            ops.append(IREffectOp("MANAGED_MARKER", "managed_block", line))
+            if not terminated:
+                ops.append(IREffectOp("MANAGED_MARKER", "managed_block", line))
             continue
         if line.startswith("//"):
             continue
         m_store = re.match(r"^([a-zA-Z_]\w*\[[^\]]+\])\s*=\s*([a-zA-Z_]\w*)$", line)
         if m_store:
-            ops.append(IREffectOp("STORE_BACK", m_store.group(1), m_store.group(2)))
+            if not terminated:
+                ops.append(IREffectOp("STORE_BACK", m_store.group(1), m_store.group(2)))
             continue
         m_send = re.match(r"^([a-zA-Z_]\w*)\s*<-\s*(.+)$", line)
         if m_send:
-            ops.append(IREffectOp("MOVE_SEND", m_send.group(1), m_send.group(2).strip()))
+            if not terminated:
+                ops.append(IREffectOp("MOVE_SEND", m_send.group(1), m_send.group(2).strip()))
             continue
         m_rel = re.match(r"^__hy_release\(([a-zA-Z_]\w*)\)$", line)
         if m_rel:
-            ops.append(IREffectOp("MATCH_RELEASE", m_rel.group(1), ""))
+            if not terminated:
+                ops.append(IREffectOp("MATCH_RELEASE", m_rel.group(1), ""))
             continue
-        if line.startswith("return"):
-            ret_val = line[len("return"):].strip() or "void"
-            ops.append(IREffectOp("EXIT", f"return:{ret_val}", ""))
+        if line == "return" or line.startswith("return "):
+            if not terminated:
+                ret_val = line[len("return"):].strip() or "void"
+                ops.append(IREffectOp("EXIT", f"return:{ret_val}", ""))
+                terminated = True
             continue
         if line in ("break", "continue"):
-            ops.append(IREffectOp("EXIT", line, ""))
+            if not terminated:
+                ops.append(IREffectOp("EXIT", line, ""))
+                terminated = True
             continue
         m_call = re.match(r"^(?:[a-zA-Z_]\w*\s*:?=\s*)?([a-zA-Z_][\w.]*)\((.*)\)$", line)
         if m_call:
             callee, arg = m_call.group(1), m_call.group(2).strip()
-            if effect_summaries.get(callee, "opaque_effect") != "pure":
+            if not terminated and effect_summaries.get(callee, "opaque_effect") != "pure":
                 ops.append(IREffectOp("EFFECT_CALL", callee, arg))
             continue
         if re.match(r"^__hy_loan_\d+\s*:=\s*[a-zA-Z_]\w*\[[^\]]+\]$", line):
@@ -125,10 +174,9 @@ def validate_translation(
     ):
         return ValidationVerdict(False, "TV-E001_DIGEST_MISMATCH", "Certificate digest mismatch.", [], (time.perf_counter() - t0) * 1000.0)
 
-    go_ops, err = parse_lowered_go_cfg(go_source, effect_summaries)
+    go_ops, err = parse_lowered_go_cfg(go_source, effect_summaries, target_fn=ir.fn_name)
     if err is not None or go_ops is None:
         return ValidationVerdict(False, "TV-E002_UNSUPPORTED_CONSTRUCT", err or "Unsupported construct", [], (time.perf_counter() - t0) * 1000.0)
-
     if any(o.kind == "MANAGED_MARKER" for o in go_ops) and not ir.allow_managed:
         return ValidationVerdict(False, "TV-E007_UNAUTHORIZED_MANAGED", "Unauthorized managed boundary.", go_ops, (time.perf_counter() - t0) * 1000.0)
 
@@ -147,7 +195,6 @@ def validate_translation(
     actual_exits = [o.target for o in go_ops if o.kind == "EXIT"]
     if not actual_exits or actual_exits[-1] != ir.expected_exit:
         return ValidationVerdict(False, "TV-E006_EXIT_REDIRECT", "Exit terminator redirected.", go_ops, (time.perf_counter() - t0) * 1000.0)
-
     return ValidationVerdict(True, "CERTIFIED", "All obligations discharged.", go_ops, (time.perf_counter() - t0) * 1000.0)
 
 
@@ -165,9 +212,7 @@ def evaluate_w013_corpus() -> Dict[str, object]:
         ),
     )
     valid_go = "func settle_account(id string) string {\n  __hy_loan_0 := accounts[id]\n  audit.Log(\"begin\")\n  accounts[id] = __hy_loan_0\n  out_ch <- receipt\n  __hy_release(__hy_match_tmp)\n  ledger.Commit(id)\n  return ok\n}"
-    cert = build_certificate(base_ir, valid_go, effect_summaries)
-    pos_verdict = validate_translation(base_ir, valid_go, cert, effect_summaries)
-
+    pos_verdict = validate_translation(base_ir, valid_go, build_certificate(base_ir, valid_go, effect_summaries), effect_summaries)
     mutations = {
         "M1_drop_store_back": valid_go.replace("  accounts[id] = __hy_loan_0\n", ""),
         "M2_reorder_store_back_across_call": valid_go.replace("  accounts[id] = __hy_loan_0\n", "").replace("  return ok", "  accounts[id] = __hy_loan_0\n  return ok"),
@@ -175,9 +220,11 @@ def evaluate_w013_corpus() -> Dict[str, object]:
         "M4_redirect_exit": valid_go.replace("return ok", "return err_fallback"),
         "M5_unauthorized_managed": valid_go.replace("func settle_account(id string) string {", "func settle_account(id string) string {\n  // hy:managed(\"sneak\", \"unsafe\")"),
         "M6_unmodeled_panic": "func settle_account(id string) string {\n  panic(\"abort\")\n}",
+        "M7_early_return_dead_effect": valid_go.replace("  __hy_loan_0 := accounts[id]\n", "  return ok\n  __hy_loan_0 := accounts[id]\n"),
+        "M8_wrong_target_function": valid_go.replace("func settle_account(", "func other_account("),
     }
     mutation_results = {k: validate_translation(base_ir, g, build_certificate(base_ir, g, effect_summaries), effect_summaries).code for k, g in mutations.items()}
-    validator_tcb_loc = 148
+    validator_tcb_loc = 172
     return {
         "positive_certified": pos_verdict.certified,
         "positive_code": pos_verdict.code,
